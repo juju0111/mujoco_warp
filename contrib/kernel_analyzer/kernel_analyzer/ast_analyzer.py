@@ -100,6 +100,26 @@ class InvalidWrite(Issue):
     return f'"{self.node.id}" invalid write: parameter is read-only'
 
 
+@dataclasses.dataclass
+class MissingModuleUnique(Issue):
+  def __str__(self):
+    return f'"{self.kernel}" nested kernel missing module="unique"'
+
+
+@dataclasses.dataclass
+class ParenthesizedArraySyntax(Issue):
+  def __str__(self):
+    return f'"{self.node.arg}" uses parenthesized wp.array(dtype=X) syntax, use wp.array[X] instead'
+
+
+@dataclasses.dataclass
+class MissingBatchModulo(Issue):
+  param_name: str
+
+  def __str__(self):
+    return f'"{self.param_name}" is a *-dimensioned field; first index must use "% {self.param_name}.shape[0]"'
+
+
 # TODO(team): add argument order analyzer.
 # this one is tricky because just verifying order does not tell you if the arguments
 # match the parameter signature.
@@ -115,8 +135,10 @@ def _get_classes(src: str) -> Dict[str, List[Tuple[str, str]]]:
   for line in src.splitlines():
     if line.startswith("class "):
       class_name = line[len("class ") : -1]
-    elif '"""' in line:
-      in_docstring = not in_docstring
+    if line.strip().startswith('"""'):
+      in_docstring = True
+    if line.strip().endswith('"""'):
+      in_docstring = False
 
     m = field_pattern.match(line)
     if not class_name or not m or in_docstring:
@@ -169,16 +191,25 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
   # get class fields and types for Model and Data
   type_classes = _get_classes(type_source)
   field_info = {}
+  star_fields = set()  # fields with "*" first dimension
 
   for field, typ in type_classes["Model"]:
     if field == "opt":
       for sfield, styp in type_classes["Option"]:
-        field_info[field + "_" + sfield] = ("Model", styp, len(field_info))
+        full_name = field + "_" + sfield
+        field_info[full_name] = ("Model", styp, len(field_info))
+        if styp.startswith('array("*"'):
+          star_fields.add(full_name)
     elif field == "stat":
       for sfield, styp in type_classes["Statistic"]:
-        field_info[field + "_" + sfield] = ("Model", styp, len(field_info))
+        full_name = field + "_" + sfield
+        field_info[full_name] = ("Model", styp, len(field_info))
+        if styp.startswith('array("*"'):
+          star_fields.add(full_name)
     else:
       field_info[field] = ("Model", typ, len(field_info))
+      if typ.startswith('array("*"'):
+        star_fields.add(field)
 
   for field, typ in type_classes["Data"]:
     if field == "efc":
@@ -199,20 +230,39 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
   issues: List[Issue] = []
   source_lines = source.splitlines()
 
-  for node in ast.walk(tree):
-    if not isinstance(node, ast.FunctionDef):
-      continue
+  def _is_kernel(name: str) -> bool:
+    """Check if decorator is wp.kernel."""
+    return name and (name == "wp.kernel" or name.startswith("wp.kernel("))
 
-    is_kernel = False
+  def _is_func(name: str) -> bool:
+    """Check if decorator is wp.func."""
+    return name and (name == "wp.func" or name.startswith("wp.func("))
+
+  def _analyze_function(node: ast.FunctionDef, is_nested: bool):
+    """Analyze a function definition for kernel issues."""
+    # Recursively check nested functions first
+    for child in ast.iter_child_nodes(node):
+      if isinstance(child, ast.FunctionDef):
+        _analyze_function(child, is_nested=True)
+
+    # Find wp.kernel or wp.func decorator
+    decorator = None
     for d in node.decorator_list:
-      decorator_name = ast.get_source_segment(source, d)
-      if decorator_name in ("kernel", "warp_util.kernel", "wp.kernel", "wp.func"):
-        is_kernel = True
+      decorator = ast.get_source_segment(source, d)
+      if _is_kernel(decorator) or _is_func(decorator):
         break
+    else:
+      return  # not a kernel/func
 
-    if not is_kernel:
-      continue
+    # Nested wp.kernel must have module="unique" (wp.func doesn't need it)
+    if is_nested and _is_kernel(decorator):
+      if 'module="unique"' not in decorator and "module='unique'" not in decorator:
+        issues.append(MissingModuleUnique(node, node.name))
 
+    _analyze_kernel(node)
+
+  def _analyze_kernel(node: ast.FunctionDef):
+    """Analyze kernel parameters and body."""
     kernel, args = node.name, node.args
 
     # defaults not allowed
@@ -256,6 +306,11 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
       param_type = ast.get_source_segment(source, param.annotation)
       param_type = param_type.replace("types.", "")  # ignore types module prefix
       param_types[param_name] = param_type
+
+      # enforce bracket syntax: wp.array[X] not wp.array(dtype=X)
+      if re.search(r"wp\.array\d*d?\(dtype=", param_type):
+        issues.append(ParenthesizedArraySyntax(param, kernel))
+
       has_suffix = param_name.endswith("_in") or param_name.endswith("_out")
       field_name = param_name[: param_name.rfind("_")] if has_suffix else param_name
       param_out = param_name.endswith("_out") or param_name in ("res", "out")
@@ -264,6 +319,8 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
       if "array" in param_type:
         param_reftypes.add(param_name)
       param_source, expected_type, param_order = field_info.get(field_name, (None, None, None))
+
+      # TODO(team): indicate array slice with suffix and check type?
 
       # if parameters are multi-line, parameters must be grouped by comments of the form
       # "{source} {in | out | ""}:" e.g. "Model:" or "Data in:" or "Out:"
@@ -283,6 +340,22 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
           expected_type = "float"
         elif "wp.bool" in param_type:
           expected_type = "bool"
+      elif expected_type.startswith("array("):
+        # array(...) is our custom annotation that we can translate to wp.array
+        expected_dtype = expected_type[expected_type.rfind(" ") + 1 : -1]
+        expected_ndim = expected_type.count(",")
+        if expected_ndim == 1:
+          expected_type = f"wp.array[{expected_dtype}]"
+        else:
+          expected_type = f"wp.array{expected_ndim}d[{expected_dtype}]"
+      elif m := re.match(r"wp\.array(\d?)d?\(dtype=([\w.]+)\)", expected_type):
+        # wp.array(dtype=X) or wp.arrayNd(dtype=X) from types.py field specs
+        ndim_str, dtype = m.group(1), m.group(2)
+        if ndim_str and ndim_str != "1":
+          expected_type = f"wp.array{ndim_str}d[{dtype}]"
+        else:
+          expected_type = f"wp.array[{dtype}]"
+
       expected_types[param_name] = expected_type
       if expected_type and param_type != expected_type:
         issues.append(TypeMismatch(param, kernel, expected_type, param_source))
@@ -303,7 +376,7 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
     # 3) matching Model field order or Data field order
     expected_ordering = sorted(params_ordering)
     if params_ordering != expected_ordering:
-      expected_names = [p[-1] for p in expected_ordering]
+      expected_names = [p[3] for p in expected_ordering]
       node.col_offset = node.col_offset + 4
       node.end_lineno = node.lineno
       node.end_col_offset = node.col_offset + len(node.name)
@@ -313,9 +386,10 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
       for e in expected_ordering:
         if prev != e[:2]:
           src = {0: "Model", 1: "Data", 2: None}[e[1]]
-          expected_full.append(_get_arg_expected_comment(src, e[0]))
-        type_ = expected_types[e[-1]] or param_types[e[-1]]
-        expected_full.append(e[-1] + ": " + type_ + ",")
+          is_out = e[0]
+          expected_full.append(_get_arg_expected_comment(src, is_out))
+        type_ = expected_types[e[3]] or param_types[e[3]]
+        expected_full.append(e[3] + ": " + type_ + ",")
         prev = e[:2]
       issues.append(InvalidParamOrder(node, kernel, expected_names, expected_full, arg_range))
 
@@ -338,6 +412,68 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
         if assignee in param_names and assignee not in param_outs and assignee in param_reftypes:
           issues.append(InvalidWrite(sub_node.value, kernel))
       # TODO: atomic_add, atomic_sub
+
+    # check *-dimensioned Model fields are indexed with % shape[0]
+    star_params = {p for p in param_names if p in star_fields and p in param_reftypes}
+    if star_params:
+
+      def _is_modulo_shape0(index_node: ast.AST, param_name: str) -> bool:
+        """Check if index is `expr % param.shape[0]`."""
+        if not isinstance(index_node, ast.BinOp):
+          return False
+        if not isinstance(index_node.op, ast.Mod):
+          return False
+        # right side must be param.shape[0]
+        rhs = index_node.right
+        if not isinstance(rhs, ast.Subscript):
+          return False
+        rhs_src = ast.get_source_segment(source, rhs)
+        return rhs_src == f"{param_name}.shape[0]"
+
+      # Pass 1: find precomputed safe indices
+      # e.g., `gear_id = worldid % actuator_gear.shape[0]`
+      safe_indices: Dict[str, str] = {}  # var_name -> param_name
+      for sub_node in ast.walk(node):
+        if isinstance(sub_node, ast.Assign) and len(sub_node.targets) == 1:
+          target = sub_node.targets[0]
+          if isinstance(target, ast.Name) and isinstance(sub_node.value, ast.BinOp):
+            for sp in star_params:
+              if _is_modulo_shape0(sub_node.value, sp):
+                safe_indices[target.id] = sp
+                break
+
+      # Pass 2: check all subscript accesses on *-dimensioned params
+      for sub_node in ast.walk(node):
+        if not isinstance(sub_node, ast.Subscript):
+          continue
+        # check if the subscript target is a *-dimensioned param
+        if not isinstance(sub_node.value, ast.Name):
+          continue
+        param_name = sub_node.value.id
+        if param_name not in star_params:
+          continue
+
+        # get the first index (the batch/world dimension)
+        idx = sub_node.slice
+        if isinstance(idx, ast.Tuple) and idx.elts:
+          first_idx = idx.elts[0]
+        else:
+          first_idx = idx
+
+        # check: inline modulo pattern
+        if _is_modulo_shape0(first_idx, param_name):
+          continue
+
+        # check: precomputed safe index variable
+        if isinstance(first_idx, ast.Name) and safe_indices.get(first_idx.id) == param_name:
+          continue
+
+        issues.append(MissingBatchModulo(sub_node, kernel, param_name))
+
+  # Analyze all top-level function definitions
+  for node in ast.iter_child_nodes(tree):
+    if isinstance(node, ast.FunctionDef):
+      _analyze_function(node, is_nested=False)
 
   # skip issues in ignored lines
   ignore_lines = set()

@@ -14,11 +14,10 @@
 # ==============================================================================
 
 import functools
-from typing import Callable, Optional
+import inspect
+import warnings
 
 import warp as wp
-from warp.context import Module
-from warp.context import get_module
 
 _STACK = None
 
@@ -88,7 +87,7 @@ def _merge(a: dict, b: dict) -> dict:
 
 
 def event_scope(fn, name: str = ""):
-  """Wraps a function and records an event before and after the fucntion invocation."""
+  """Wraps a function and records an event before and after the function invocation."""
   name = name or getattr(fn, "__name__")
 
   @functools.wraps(fn)
@@ -96,6 +95,11 @@ def event_scope(fn, name: str = ""):
     global _STACK
     if _STACK is None:
       return fn(*args, **kwargs)
+
+    for frame_info in inspect.stack():
+      if frame_info.function in ("capture_while", "capture_if"):
+        return fn(*args, **kwargs)
+
     # push into next level of stack
     saved_stack, _STACK = _STACK, {}
     beg = wp.Event(enable_timing=True)
@@ -115,58 +119,41 @@ def event_scope(fn, name: str = ""):
   return wrapper
 
 
-# @kernel decorator to automatically set up modules based on nested
-# function names
-def kernel(
-  f: Optional[Callable] = None,
-  *,
-  enable_backward: Optional[bool] = None,
-  module: Optional[Module] = None,
-):
-  """
-  Decorator to register a Warp kernel from a Python function.
-  The function must be defined with type annotations for all arguments.
-  The function must not return anything.
-
-  Example::
-
-      @kernel
-      def my_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float)):
-        tid = wp.tid()
-        b[tid] = a[tid] + 1.0
+def check_toolkit_driver():
+  wp.init()
+  if wp.get_device().is_cuda:
+    if not wp.is_conditional_graph_supported():
+      warnings.warn(
+        """
+        CUDA version < 12.4 detected
+        - graph capture may be unreliable for < 12.3
+        - conditional graph nodes are not available for < 12.4
+          Model.opt.graph_conditional should be set to False
+        """,
+        stacklevel=2,
+      )
 
 
-      @kernel(enable_backward=False)
-      def my_kernel_no_backward(a: wp.array(dtype=float, ndim=2), x: float):
-        # the backward pass will not be generated
-        i, j = wp.tid()
-        a[i, j] = x
+class scoped_mathdx_gemm_disabled:
+  """Temporarily disable Warp MathDx GEMM kernels within this scope."""
 
+  def __init__(self, disable: bool = True):
+    self._disable = disable
+    self._config = None
+    self._prev = None
 
-      @kernel(module="unique")
-      def my_kernel_unique_module(a: wp.array(dtype=float), b: wp.array(dtype=float)):
-        # the kernel will be registered in new unique module created just for this
-        # kernel and its dependent functions and structs
-        tid = wp.tid()
-        b[tid] = a[tid] + 1.0
+  def __enter__(self):
+    if not self._disable:
+      return self
+    config = getattr(wp, "config", None)
+    if config is None or not hasattr(config, "enable_mathdx_gemm"):
+      return self
+    self._config = config
+    self._prev = config.enable_mathdx_gemm
+    self._config.enable_mathdx_gemm = False
+    return self
 
-  Args:
-      f: The function to be registered as a kernel.
-      enable_backward: If False, the backward pass will not be generated.
-      module: The :class:`warp.context.Module` to which the kernel belongs. Alternatively,
-              if a string `"unique"` is provided, the kernel is assigned to a new module
-              named after the kernel name and hash. If None, the module is inferred from
-              the function's module.
-
-  Returns:
-      The registered kernel.
-  """
-  if module is None:
-    # create a module name based on the name of the nested function
-    # get the qualified name, e.g. "main.<locals>.nested_kernel"
-    qualname = f.__qualname__
-    parts = [part for part in qualname.split(".") if part != "<locals>"]
-    outer_functions = parts[:-1]
-    module = get_module(".".join([f.__module__] + outer_functions))
-
-  return wp.kernel(f, enable_backward=enable_backward, module=module)
+  def __exit__(self, exc_type, exc, tb):
+    if self._config is not None:
+      self._config.enable_mathdx_gemm = self._prev
+    return False

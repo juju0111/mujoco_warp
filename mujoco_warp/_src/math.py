@@ -17,7 +17,7 @@ from typing import Any, Tuple
 
 import warp as wp
 
-from . import types
+from mujoco_warp._src import types
 
 
 @wp.func
@@ -58,21 +58,58 @@ def axis_angle_to_quat(axis: wp.vec3, angle: float) -> wp.quat:
 
 @wp.func
 def quat_to_mat(quat: wp.quat) -> wp.mat33:
-  """Converts a quaternion into a 9-dimensional rotation matrix."""
-  vec = wp.vec4(quat[0], quat[1], quat[2], quat[3])
-  q = wp.outer(vec, vec)
+  """Converts a quaternion into 3x3 rotation matrix."""
+  q00 = quat[0] * quat[0]
+  q01 = quat[0] * quat[1]
+  q02 = quat[0] * quat[2]
+  q03 = quat[0] * quat[3]
+  q11 = quat[1] * quat[1]
+  q12 = quat[1] * quat[2]
+  q13 = quat[1] * quat[3]
+  q22 = quat[2] * quat[2]
+  q23 = quat[2] * quat[3]
+  q33 = quat[3] * quat[3]
 
   return wp.mat33(
-    q[0, 0] + q[1, 1] - q[2, 2] - q[3, 3],
-    2.0 * (q[1, 2] - q[0, 3]),
-    2.0 * (q[1, 3] + q[0, 2]),
-    2.0 * (q[1, 2] + q[0, 3]),
-    q[0, 0] - q[1, 1] + q[2, 2] - q[3, 3],
-    2.0 * (q[2, 3] - q[0, 1]),
-    2.0 * (q[1, 3] - q[0, 2]),
-    2.0 * (q[2, 3] + q[0, 1]),
-    q[0, 0] - q[1, 1] - q[2, 2] + q[3, 3],
+    q00 + q11 - q22 - q33,
+    2.0 * (q12 - q03),
+    2.0 * (q13 + q02),
+    2.0 * (q12 + q03),
+    q00 - q11 + q22 - q33,
+    2.0 * (q23 - q01),
+    2.0 * (q13 - q02),
+    2.0 * (q23 + q01),
+    q00 - q11 - q22 + q33,
   )
+
+
+@wp.func
+def quat_z2vec(vec: wp.vec3) -> wp.quat:
+  """Compute quaternion performing rotation from z-axis to given vector."""
+  quat = wp.quat(0.0, 0.0, 0.0, 1.0)
+
+  # normalize vector; if too small, no rotation
+  norm = wp.length(vec)
+  if norm < types.MJ_MINVAL:
+    return quat
+  vec = vec / norm
+
+  axis = wp.vec3(-vec[1], vec[0], 0.0)
+  a = wp.length(axis)
+
+  # almost parallel
+  if a < types.MJ_MINVAL:
+    # opposite: 180 deg rotation around x axis
+    if vec[2] < 0.0:
+      quat = wp.quat(1.0, 0.0, 0.0, 0.0)
+    return quat
+
+  # make quaternion from angle and axis
+  axis = axis / a
+  angle = wp.atan2(a, vec[2])
+  quat = axis_angle_to_quat(axis, angle)
+
+  return quat
 
 
 @wp.func
@@ -96,7 +133,6 @@ def inert_vec(i: types.vec10, v: wp.spatial_vector) -> wp.spatial_vector:
 @wp.func
 def motion_cross(u: wp.spatial_vector, v: wp.spatial_vector) -> wp.spatial_vector:
   """Cross product of two motions."""
-
   u0 = wp.vec3(u[0], u[1], u[2])
   u1 = wp.vec3(u[3], u[4], u[5])
   v0 = wp.vec3(v[0], v[1], v[2])
@@ -111,7 +147,6 @@ def motion_cross(u: wp.spatial_vector, v: wp.spatial_vector) -> wp.spatial_vecto
 @wp.func
 def motion_cross_force(v: wp.spatial_vector, f: wp.spatial_vector) -> wp.spatial_vector:
   """Cross product of a motion and a force."""
-
   v0 = wp.vec3(v[0], v[1], v[2])
   v1 = wp.vec3(v[3], v[4], v[5])
   f0 = wp.vec3(f[0], f[1], f[2])
@@ -191,6 +226,16 @@ def orthonormal(normal: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def orthonormal_to_z(normal: wp.vec3) -> wp.vec3:
+  if wp.abs(normal[0]) < wp.abs(normal[1]):
+    dir = wp.vec3(1.0 - normal[0] * normal[0], -normal[0] * normal[1], -normal[0] * normal[2])
+  else:
+    dir = wp.vec3(-normal[1] * normal[0], 1.0 - normal[1] * normal[1], -normal[1] * normal[2])
+  dir, _ = gjk_normalize(dir)
+  return dir
+
+
+@wp.func
 def gjk_normalize(a: wp.vec3):
   norm = wp.length(a)
   if norm > 1e-8 and norm < 1e12:
@@ -239,7 +284,6 @@ def closest_segment_point_and_dist(a: wp.vec3, b: wp.vec3, pt: wp.vec3) -> Tuple
 @wp.func
 def closest_segment_to_segment_points(a0: wp.vec3, a1: wp.vec3, b0: wp.vec3, b1: wp.vec3) -> Tuple[wp.vec3, wp.vec3]:
   """Returns closest points between two line segments."""
-
   dir_a, len_a = normalize_with_norm(a1 - a0)
   dir_b, len_b = normalize_with_norm(b1 - b0)
 
@@ -271,10 +315,19 @@ def closest_segment_to_segment_points(a0: wp.vec3, a1: wp.vec3, b0: wp.vec3, b1:
 
 
 @wp.func
-def safe_div(x: float, y: float) -> float:
+def safe_div(x: Any, y: Any) -> Any:
   return x / wp.where(y != 0.0, y, types.MJ_MINVAL)
 
 
 @wp.func
 def upper_tri_index(n: int, i: int, j: int) -> int:
-  return (n * (n - 1) - (n - i) * (n - i - 1)) / 2 + j - i - 1
+  """Returns index of a_ij = a_ji in upper triangular matrix (excluding diagonal)."""
+  return (i * (2 * n - i - 3)) // 2 + j - 1
+
+
+@wp.func
+def upper_trid_index(n: int, i: int, j: int) -> int:
+  """Returns index of a_ij = a_ji in upper triangular matrix (including diagonal)."""
+  if j < i:
+    i, j = j, i
+  return (i * (2 * n - i - 1)) // 2 + j
